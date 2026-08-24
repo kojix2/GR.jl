@@ -1,30 +1,27 @@
 # Note that this script can accept some limited command-line arguments, run
 # `julia build_tarballs.jl --help` to see a usage message.
-#
-# Examples:
-#   - env BINARYBUILDER_AUTOMATIC_APPLE=true julia build_tarballs.jl x86_64-apple-darwin14
-#   - julia build_tarballs.jl x86_64-linux-gnu
-#   - julia build_tarballs.jl x86_64-w64-mingw32
-#
 using BinaryBuilder
 
+const YGGDRASIL_DIR = "../.."
+include(joinpath(YGGDRASIL_DIR, "fancy_toys.jl"))
+
 name = "GR"
-version = v"0.64.4"
+version = v"0.73.27"
 
 # Collection of sources required to complete build
 sources = [
-    GitSource("https://github.com/sciapp/gr.git", "edc9897a3ba3b13a0a457793f9044d33470b9e5e"),
+    GitSource("https://github.com/sciapp/gr.git", "85efc4994e9f96eedfda255db199d4fb9d33a418"),
     FileSource("https://github.com/sciapp/gr/releases/download/v$version/gr-$version.js",
-               "63fa20d2ecb6df6ae23fa13a650b3aecbff6684dd459a380f24fc77b2e15c257", "gr.js")
+               "0b27c9e265d6cf84ad3ca299a9a1c27068074c0274fffd1a7af4997e942c4578", "gr.js"),
+    ArchiveSource("https://github.com/roblabla/MacOSX-SDKs/releases/download/macosx14.0/MacOSX14.0.sdk.tar.xz",
+                  "4a31565fd2644d1aec23da3829977f83632a20985561a2038e198681e7e7bf49")
 ]
 
 # Bash recipe for building across all platforms
 script = raw"""
 cd $WORKSPACE/srcdir/gr
 
-if test -f "$prefix/lib/cmake/Qt5Gui/Qt5GuiConfigExtras.cmake"; then
-    sed -i 's/_qt5gui_find_extra_libs.*AGL.framework.*//' $prefix/lib/cmake/Qt5Gui/Qt5GuiConfigExtras.cmake
-fi
+apk del cmake
 
 update_configure_scripts
 
@@ -32,9 +29,15 @@ make -C 3rdparty/qhull -j${nproc}
 
 if [[ $target == *"mingw"* ]]; then
     winflags=-DCMAKE_C_FLAGS="-D_WIN32_WINNT=0x0f00"
-    tifflags=-DTIFF_LIBRARY=${libdir}/libtiff-5.dll
+    tifflags=-DTIFF_LIBRARY=${libdir}/libtiff-6.dll
 else
     tifflags=-DTIFF_LIBRARY=${libdir}/libtiff.${dlext}
+fi
+
+if [[ "${target}" == x86_64-apple-darwin* ]]; then
+    apple_sdk_root=$WORKSPACE/srcdir/MacOSX14.0.sdk
+    sed -i "s!/opt/x86_64-apple-darwin14/x86_64-apple-darwin14/sys-root!$apple_sdk_root!" $CMAKE_TARGET_TOOLCHAIN
+    export MACOSX_DEPLOYMENT_TARGET=12
 fi
 
 if [[ "${target}" == *apple* ]]; then
@@ -70,40 +73,54 @@ platforms = [
     Platform("i686",  "linux"; libc="glibc"),
     Platform("powerpc64le",  "linux"; libc="glibc"),
     Platform("x86_64",  "windows"),
-    Platform("i686",  "windows"),    
+    Platform("i686",  "windows"),
     Platform("x86_64",  "macos"),
+    Platform("aarch64", "macos"),
     Platform("x86_64",  "freebsd"),
 ]
 platforms = expand_cxxstring_abis(platforms)
 
 # The products that we will ensure are always built
 products = [
-    LibraryProduct("libGR", :libGR),
-    LibraryProduct("libGR3", :libGR3),
-    LibraryProduct("libGRM", :libGRM),
-    LibraryProduct("libGKS", :libGKS),
+    LibraryProduct("libGR", :libGR; dont_dlopen=true),
+    LibraryProduct("libGR3", :libGR3; dont_dlopen=true),
+    LibraryProduct("libGRM", :libGRM; dont_dlopen=true),
+    LibraryProduct("libGKS", :libGKS; dont_dlopen=true),
     ExecutableProduct("gksqt", :gksqt),
+    ExecutableProduct("grplot", :grplot),
 ]
 
 # Dependencies that must be installed before this package can be built
 dependencies = [
-    Dependency("Bzip2_jll"),
-    Dependency("Cairo_jll"),
+    Dependency("Bzip2_jll"; compat="1.0.9"),
+    Dependency("Cairo_jll"; compat="1.16.1"),
     Dependency("FFMPEG_jll"),
     Dependency("Fontconfig_jll"),
+    Dependency("FreeType2_jll"; compat="2.13.4"),
     Dependency("GLFW_jll"),
     Dependency("JpegTurbo_jll"),
     Dependency("libpng_jll"),
-    Dependency("Libtiff_jll"),
+    Dependency("Libtiff_jll"; compat="4.7.1"),
     Dependency("Pixman_jll"),
-#    Dependency("Qhull_jll"),
-    Dependency("Qt5Base_jll"),
+    HostBuildDependency("Qt6Base_jll"),
+    Dependency("Qt6Base_jll"; compat="~6.10.2"),
     BuildDependency("Xorg_libX11_jll"),
     BuildDependency("Xorg_xproto_jll"),
-    Dependency("Zlib_jll"),
+    Dependency("Zlib_jll"; compat="1.2.12"),
+    HostBuildDependency("CMake_jll"),
 ]
 
+platforms_win = filter(Sys.iswindows, platforms)
+platforms_rest = setdiff(platforms, platforms_win)
+
 # Build the tarballs, and possibly a `build.jl` as well.
-# GCC version 7 because of ffmpeg, but building against Qt requires v8 on Windows.
-build_tarballs(ARGS, name, version, sources, script, platforms, products, dependencies;
-               preferred_gcc_version = v"8")
+# GCC version 11 because of Qt6.10
+if any(should_build_platform.(triplet.(platforms_win)))
+    # GCC 12 and before fail with internal compiler error on mingw
+    build_tarballs(ARGS, name, version, sources, script, platforms_win, products, dependencies;
+                   preferred_gcc_version=v"13", julia_compat="1.6")
+end
+if any(should_build_platform.(triplet.(platforms_rest)))
+    build_tarballs(ARGS, name, version, sources, script, platforms_rest, products, dependencies;
+                   preferred_gcc_version=v"11", julia_compat="1.6")
+end

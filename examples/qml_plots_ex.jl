@@ -1,7 +1,6 @@
 ENV["QSG_RENDER_LOOP"] = "basic"
 using CxxWrap # for safe_cfunction
 using QML
-using Qt5QuickControls2_jll
 using Observables
 using Plots
 import GR
@@ -19,7 +18,7 @@ function paint(p::CxxPtr{QPainter}, item::CxxPtr{JuliaPaintedItem})
   global w, h
 
   ENV["GKS_WSTYPE"] = 381
-  ENV["GKS_CONID"] = split(repr(p.cpp_object), "@")[2]
+  ENV["GKS_CONID"] = repr(UInt64(p.cpp_object))
 
   dev = device(p[])[]
   r = effectiveDevicePixelRatio(window(item[])[])

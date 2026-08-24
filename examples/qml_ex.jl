@@ -1,7 +1,6 @@
 ENV["QSG_RENDER_LOOP"] = "basic"
 using CxxWrap # for safe_cfunction
 using QML
-using Qt5QuickControls2_jll
 using Observables
 using GR
 
@@ -20,13 +19,13 @@ function paint(p::CxxPtr{QPainter}, item::CxxPtr{JuliaPaintedItem})
   global zoom
 
   ENV["GKSwstype"] = 381
-  ENV["GKSconid"] = split(repr(p.cpp_object), "@")[2]
+  ENV["GKSconid"] = repr(UInt64(p.cpp_object))
 
   dev = device(p[])[]
   r = effectiveDevicePixelRatio(window(item[])[])
   w, h = width(dev) / r, height(dev) / r
 
-  plt = gcf()
+  plt = kvs()
   plt[:size] = (w, h)
 
   if zoom === Nothing

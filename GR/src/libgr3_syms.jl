@@ -1,4 +1,4 @@
-const libGR3_syms = [
+[
 :gr3_geterror
 :gr3_init
 :gr3_free
@@ -27,6 +27,11 @@ const libGR3_syms = [
 :gr3_setbackgroundcolor
 :gr3_createisosurfacemesh
 :gr3_surface
+:gr3_setalphamode
+:gr3_getalphamode
+:gr3_setlightparameters
+:gr3_getlightparameters
+:gr3_isosurface
 :gr_volume
 :gr3_createxslicemesh
 :gr3_createyslicemesh

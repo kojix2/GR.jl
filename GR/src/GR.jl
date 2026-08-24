@@ -1,4 +1,3 @@
-__precompile__()
 """
     GR is a universal framework for cross-platform visualization applications.
     It offers developers a compact, portable and consistent graphics library
@@ -20,43 +19,15 @@ __precompile__()
 """
 module GR
 
-using RelocatableFolders
-
 @static if isdefined(Base, :Experimental) &&
            isdefined(Base.Experimental, Symbol("@optlevel"))
     Base.Experimental.@optlevel 1
 end
 
-if Sys.KERNEL == :NT
-  const os = :Windows
-else
-  const os = Sys.KERNEL
+if haskey(ENV, "WAYLAND_DISPLAY") || get(ENV, "XDG_SESSION_TYPE", "") == "wayland"
+  # loading this automatially on Wayland ensures that applications run natively on Wayland without user intervention
+  using Qt6Wayland_jll
 end
-
-const depsfile = @path joinpath(dirname(@__DIR__), "deps", "deps.jl")
-const depsfile_succeeded = Ref(true)
-# Include Builder module in case we need to rebuild
-const buildfile = @path joinpath(dirname(@__DIR__), "deps", "build.jl")
-
-if os == :Windows
-    const libGR = "libGR.dll"
-    const libGR3 = "libGR3.dll"
-    const libGRM = "libGRM.dll"
-elseif os == :Darwin
-    const libGR = "libGR.dylib"
-    const libGR3 = "libGR3.dylib"
-    const libGRM = "libGRM.dylib"
-else
-    const libGR = "libGR.so"
-    const libGR3 = "libGR3.so"
-    const libGRM = "libGRM.so"
-end
-
-const attempt_to_rebuild = Ref(true)
-const libGR_handle = Ref{Ptr{Nothing}}()
-const libGR3_handle = Ref{Ptr{Nothing}}()
-const libGRM_handle = Ref{Ptr{Nothing}}()
-const gr_provider = Ref("Unknown")
 
 import Base64
 import Libdl
@@ -122,6 +93,7 @@ export
   redrawseg,
   setsegtran,
   closeseg,
+  samplelocator,
   emergencyclosegks,
   updategks,
   setspace,
@@ -136,6 +108,7 @@ export
   polyline3d,
   polymarker3d,
   axes3d,
+  settitles3d,
   titles3d,
   surface,
   volume,
@@ -174,6 +147,7 @@ export
   endgraphics,
   getgraphics,
   drawgraphics,
+  startlistener,
   mathtex,
   inqmathtex,
   selectcontext,
@@ -191,6 +165,7 @@ export
   sendmeta,
   sendmetaref,
   closemeta,
+  grplot,
   shadepoints,
   shadelines,
   setcolormapfromrgb,
@@ -209,22 +184,36 @@ export
   inqtextencoding,
   loadfont,
   inqvpsize,
+  setpicturesizeforvolume,
   inqtransformationparameters,
   polygonmesh3d,
   setscientificformat,
+  setnominalsize,
+  inqprojectiontype,
+  setmathfont,
+  inqmathfont,
+  setclipregion,
+  inqclipregion,
+  setclipsector,
+  inqclipsector,
+  getformat,
+  ftoa,
+  beginselection,
+  endselection,
+  moveselection,
+  setbackground,
+  clearbackground,
   # Convenience functions
   jlgr,
   colormap,
   figure,
+  kvs,
   gcf,
   hold,
   usecolorscheme,
   subplot,
   plot,
   oplot,
-  semilogx,
-  semilogy,
-  loglog,
   stairs,
   scatter,
   stem,
@@ -234,7 +223,6 @@ export
   contourf,
   heatmap,
   polarheatmap,
-  nonuniformpolarheatmap,
   wireframe,
   plot3,
   scatter3,
@@ -267,16 +255,21 @@ export
   libGR3,
   gr3,
   libGRM,
+  grm,
   isinline,
   inline,
   displayname,
-  mainloop
+  mainloop,
+  axis,
+  drawaxis,
+  drawaxes,
+  GRAxis,
+  GRTick,
+  GRTickLabel
 
 const ENCODING_LATIN1 = 300
 const ENCODING_UTF8 = 301
 
-const grdir = Ref("")
-const grdir_default = joinpath(dirname(@__FILE__), "..", "deps", "gr")
 const display_name = Ref("")
 const mime_type = Ref("")
 const file_path = Ref("")
@@ -285,118 +278,20 @@ const send_c = Ref(C_NULL)
 const recv_c = Ref(C_NULL)
 const text_encoding = Ref(ENCODING_UTF8)
 const check_env = Ref(true)
+const _ijulia_loaded = Ref(false)
 
-isijulia() = isdefined(Main, :IJulia) && Main.IJulia isa Module && isdefined(Main.IJulia, :clear_output)
+isijulia() = _ijulia_loaded[]
 isatom() = isdefined(Main, :Atom) && Main.Atom isa Module && Main.Atom.isconnected() && (isdefined(Main.Atom, :PlotPaneEnabled) ? Main.Atom.PlotPaneEnabled[] : true)
 ispluto() = isdefined(Main, :PlutoRunner) && Main.PlutoRunner isa Module
 isvscode() = isdefined(Main, :VSCodeServer) && Main.VSCodeServer isa Module && (isdefined(Main.VSCodeServer, :PLOT_PANE_ENABLED) ? Main.VSCodeServer.PLOT_PANE_ENABLED[] : true)
 
+setraw!(raw) = ccall(:jl_tty_set_mode, Int32, (Ptr{Cvoid}, Int32), stdin.handle, raw)
+
+include("preferences.jl")
+
 # Load function pointer caching mechanism
 include("funcptrs.jl")
 
-function __init__()
-    #= __init__ Objectives:
-       1. Set gr_provider[] to either "BinaryBuilder" or "GR" based on depsfile
-       2. Set grdir[] global variable, defer to load_libs if gr_provider[] == "BinaryBuilder"
-       3. If grdir[] cannot be set, try to rebuild.
-    =#
-
-    # depsfile (deps/deps.jl) should contain some parseable Julia code
-    contents = nothing
-    # Initially depsfile_succeeded[] is true
-    if depsfile_succeeded[]
-        try
-            contents = isfile(depsfile) ? strip( read(depsfile, String) ) : ""
-        catch err
-            depsfile_succeeded[] = false
-            @debug "Parsing depsfile failed" depsfile contents err
-        end
-    end
-
-    # If the first line is either "import GR_jll" or "using GR_jll" then
-    # we are using the BinaryBuilder method
-    if contents == "import GR_jll" || contents == "using GR_jll"
-        gr_provider[] = "BinaryBuilder"
-    else
-        gr_provider[] = "GR"
-    end
-    @debug "GR Binaries:" GR.gr_provider[] GR.libGR GR.libGR3 GR.libGRM
-
-    # Determine grdir
-    # The environmental variable GRDIR can override the binary provider
-    # If GRDIR is "", then it will force a rebuild.
-    if "GRDIR" in keys(ENV)
-        grdir[] = ENV["GRDIR"]
-    elseif gr_provider[] == "BinaryBuilder"
-        # Defer until load_libs() when we import GR_jll
-        #grdir = joinpath(dirname(GR_jll.libGR_path), "..")
-        grdir[] = "deferred"
-    else
-        grdir[] = ""
-        for d in ("/opt", "/usr/local", "/usr")
-            if isdir(joinpath(d, "gr", "fonts"))
-                grdir[] = joinpath(d, "gr")
-                break
-            end
-        end
-    end
-
-    if grdir[] == "" || !depsfile_succeeded[]
-        grdir[] = grdir_default
-        if isdir(grdir[]) && gr_provider[] == "GR"
-            # No need to rebuild, just use grdir_default as grdir
-        else
-            # In case "LoadError: InitError: Evaluation into the closed module `GR` breaks incremental compilation" occurs,
-            # allow the user to disable the rebuild attempt by setting the environmental variable JULIA_GR_REBUILD to false.
-            # An error will still occur recommending the user build GR manually via `Pkg.build("GR")``
-            # https://github.com/jheinen/GR.jl/issues/413
-            if attempt_to_rebuild[]
-                attempt_to_rebuild[] = parse(Bool, get(ENV,"JULIA_GR_REBUILD", "true"))
-            end
-            # Rebuild if no file at grdir_default or gr_provider[] == "BinaryBuilder"
-            if attempt_to_rebuild[]
-                attempt_to_rebuild[] = false # Avoid infinite loop
-                println("Your GR installation is incomplete. Rerunning build step for GR package.")
-                delete!(ENV, "GRDIR")
-                if !depsfile_succeeded[]
-                    # If depsfile failed, then GR_jll failed.
-                    # Switch to GR on next build.
-                    ENV["JULIA_GR_PROVIDER"] = "GR"
-                    @info "Switching provider to GR due to error in depsfile" depsfile
-                end
-                try
-                    @eval GR begin
-                        include(buildfile)
-                        Builder.build()
-                    end
-                    # Try to read depsfile again
-                    depsfile_succeeded[] = true
-                    GR.__init__()
-                    @info "GR was successfully rebuilt"
-                    return
-                catch err
-                    @warn "GR attempted to rebuild but failed due to $err. Setting ENV[\"JULIA_GR_REBUILD\"] = false."
-                    # Prevent future automatic rebuild attempts.
-                    ENV["JULIA_GR_REBUILD"] = "false"
-                end
-            end
-            error("""
-            GR was not built correctly and could not be automatically rebuilt.
-            get(ENV, "JULIA_GR_REBUILD", "true") == $(get(ENV, "JULIA_GR_REBUILD", "true"))
-            $(grdir[]) is not a directory.
-            GR_jll could not be loaded.
-
-            Run the following commands:
-
-            ENV["GRDIR"] = ""
-            using Pkg; Pkg.build("GR")
-            """)
-        end
-    end
-
-    # init(true) is deferred until load_libs
-
-end
 
 """
 function set_callback()
@@ -419,9 +314,6 @@ end
     current and subsequent calls. It is `false` by default so that
     initialization only is done once.
 
-    This is distinct from the GR module's `__init__` which only locates the
-    shared binary libraries to be used.
-
     # Extended Help
 
     Environmental variables which influence `init`:
@@ -430,7 +322,6 @@ end
     GKS_IGNORE_ENCODING - Force use of UTF-8 for font encoding, ignore GKS_ENCODING
 
     Environmental variables set by `init`:
-    GRDIR - directory of GR shared library files
     GKS_FONTPATH - path to GR fonts, often the same as GRDIR
     GKS_USE_CAIRO_PNG
     GKSwstype - Graphics workstation type, see help for `openws`
@@ -443,13 +334,21 @@ function init(always::Bool = false)
         return
     end
     if check_env[] || always
-        ENV["GRDIR"] = grdir[]
-        ENV["GKS_FONTPATH"] = grdir[]
+        haskey(ENV, "GKS_FONTPATH") || get!(ENV, "GKS_FONTPATH", GRPreferences.grdir[])
         ENV["GKS_USE_CAIRO_PNG"] = "true"
         if "GRDISPLAY" in keys(ENV)
             display_name[] = ENV["GRDISPLAY"]
-            if display_name[] == "js" || display_name[] == "pluto" || display_name[] == "js-server"
-                send_c[], recv_c[] = js.initjs()
+            if display_name[] == "js" || display_name[] == "pluto"
+                js.initjs()
+            elseif display_name[] == "plot" || display_name[] == "edit"
+                ENV["GR_PLOT"] = if Sys.iswindows()
+                    "set PATH=$(GRPreferences.libpath[]) & \"$(GRPreferences.grplot[])\" --listen"
+                else
+                    key = Sys.isapple() ? "DYLD_FALLBACK_LIBRARY_PATH" : "LD_LIBRARY_PATH"
+                    "env $key=$(GRPreferences.libpath[]) $(GRPreferences.grplot[]) --listen"
+                end
+                GR.startlistener()
+                ENV["GKS_WSTYPE"] = "nul"
             end
             @debug "Found GRDISPLAY in ENV" display_name[]
         elseif "GKS_NO_GUI" in keys(ENV)
@@ -464,32 +363,27 @@ function init(always::Bool = false)
             ENV["GKSwstype"] = "svg"
             ENV["GKS_FILEPATH"] = file_path[]
             @debug "Found an embedded environment" mime_type[] file_path[] ENV["GKSwstype"] ENV["GKS_FILEPATH"]
-        elseif gr_provider[] == "BinaryBuilder"
-            if !haskey(ENV, "GKSwstype")
-                ENV["GKSwstype"] = "gksqt"
-            end
-            if os == :Windows
-                if !haskey(ENV, "GKS_QT")
-                    ENV["GKS_QT"] = string("set PATH=", GR_jll.LIBPATH[], " & \"", GR_jll.gksqt_path, "\"")
-                elseif ENV["GKS_QT"] == ""
-                    ENV["PATH"] = GR_jll.LIBPATH[]
-                    gkqst = run(`$(GR_jll.gksqt_path)`; wait = false)
-                    # gksqt(gkscmd -> run(`gksqt`; wait=false))
+        else
+            default_wstype = haskey(ENV, "DISPLAY") ? "gksqt" : ""
+            haskey(ENV, "GKSwstype") || get!(ENV, "GKSwstype", default_wstype)
+            if !haskey(ENV, "GKS_QT")
+                ENV["GKS_QT"] = if Sys.iswindows()
+                    "set PATH=$(GRPreferences.libpath[]) & \"$(GRPreferences.gksqt[])\""
+                else
+                    key = Sys.isapple() ? "DYLD_FALLBACK_LIBRARY_PATH" : "LD_LIBRARY_PATH"
+                    "env $key=$(GRPreferences.libpath[]) $(GRPreferences.gksqt[])"
                 end
-            else
-                env = (os == :Darwin) ? "DYLD_FALLBACK_LIBRARY_PATH" : "LD_LIBRARY_PATH"
-                ENV["GKS_QT"] = string("env $env=", GR_jll.LIBPATH[], " ", GR_jll.gksqt_path)
             end
-            @debug "BinaryBuilder Setup" ENV["GKSwstype"] os ENV["GKS_QT"] ENV["PATH"] GR_jll.LIBPATH[] GR_jll.gksqt_path
+            @debug "Artifacts setup" ENV["GKSwstype"] ENV["GKS_QT"]
         end
         if "GKS_IGNORE_ENCODING" in keys(ENV)
             text_encoding[] = ENCODING_UTF8
             @debug "Found GKS_IGNORE_ENCODING in ENV" text_encoding[]
         elseif "GKS_ENCODING" in keys(ENV)
-            if ENV["GKS_ENCODING"] == "latin1" || ENV["GKS_ENCODING"] == "latin-1"
-                text_encoding[] = ENCODING_LATIN1
+            text_encoding[] = if (enc = ENV["GKS_ENCODING"]) == "latin1" || enc == "latin-1"
+                ENCODING_LATIN1
             else
-                text_encoding[] = ENCODING_UTF8
+                ENCODING_UTF8
             end
             @debug "Found GKS_ENCODING in ENV" text_encoding[]
         else
@@ -539,6 +433,21 @@ function st_seq()
         "\a\033\\"
     else
         "\a"
+    end
+end
+
+function is_dark_mode()
+    try
+        setraw!(true)
+        print(stdin, "\033]11;?\033\\")
+        resp = read(stdin, 24)
+        setraw!(false)
+        bg = String(resp)[10:23]
+        red, green, blue = parse.(Int, rsplit(bg, '/'), base=16) ./ 0xffff
+        return 0.3 * red + 0.59 * green + 0.11 * blue < 0.5
+    catch e
+        setraw!(false)
+        return false
     end
 end
 
@@ -761,7 +670,7 @@ function latin1(string)
     end
   end
   b = unsafe_wrap(Array{UInt8,1}, pointer(string), sizeof(string))
-  s = zeros(UInt8, sizeof(string) * 2)
+  s = zeros(UInt8, sizeof(string) * 2 + 1)
   len = 0
   mask = 0
   for c in b
@@ -785,6 +694,8 @@ function latin1(string)
       mask = 0
     end
   end
+  len += 1
+  s[len] = '\0'
   return s[1:len]
 end
 
@@ -1578,6 +1489,10 @@ The available text fonts are:
     +--------------------------------------+-----+
     |FONT_ZAPFDINGBATS                     |  131|
     +--------------------------------------+-----+
+    |FONT_COMPUTERMODERN                   |  232|
+    +--------------------------------------+-----+
+    |FONT_DEJAVUSANS                       |  233|
+    +--------------------------------------+-----+
 
 The available text precisions are:
 
@@ -1587,6 +1502,8 @@ The available text precisions are:
     |TEXT_PRECISION_CHAR        |  1|Character precision (medium quality)  |
     +---------------------------+---+--------------------------------------+
     |TEXT_PRECISION_STROKE      |  2|Stroke precision (lower quality)      |
+    +---------------------------+---+--------------------------------------+
+    |TEXT_PRECISION_OUTLINE     |  3|Outline precision (highest quality)   |
     +---------------------------+---+--------------------------------------+
 
 The appearance of a font depends on the text precision value specified.
@@ -2183,6 +2100,17 @@ function closeseg()
         )
 end
 
+function samplelocator()
+  x = Cdouble[0]
+  y = Cdouble[0]
+  buttons = Cint[0]
+  ccall( libGR_ptr(:gr_samplelocator),
+        Nothing,
+        (Ptr{Float64}, Ptr{Float64}, Ptr{Int32}),
+        x, y, buttons)
+  return x[1], y[1], buttons[1]
+end
+
 function emergencyclosegks()
   ccall( libGR_ptr(:gr_emergencyclosegks),
         Nothing,
@@ -2581,6 +2509,24 @@ function axes3d(x_tick::Real, y_tick::Real, z_tick::Real, x_org::Real, y_org::Re
 end
 
 """
+    settitles3d(x_title, y_title, z_title)
+
+Set axis titles to be displayed in subsequent axes calls.
+
+**Parameters:**
+
+`x_title`, `y_title`, `z_title` :
+    The text to be displayed on each axis
+
+"""
+function settitles3d(x_title, y_title, z_title)
+  ccall( libGR_ptr(:gr_settitles3d),
+        Nothing,
+        (Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}),
+        latin1(x_title), latin1(y_title), latin1(z_title))
+end
+
+"""
     titles3d(x_title, y_title, z_title)
 
 Display axis titles just outside of their respective axes.
@@ -2660,7 +2606,7 @@ function surface(px, py, pz, option::Int)
           (Int32, Int32, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int32),
           nx, ny, convert(Vector{Float64}, px), convert(Vector{Float64}, py), convert(Vector{Float64}, pz), option)
   else
-    println("Arrays have incorrect length or dimension.")
+    error("Arrays have incorrect length or dimension.")
   end
 end
 
@@ -2713,7 +2659,7 @@ function contour(px, py, h, pz, major_h::Int)
           (Int32, Int32, Int32, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int32),
           nx, ny, nh, convert(Vector{Float64}, px), convert(Vector{Float64}, py), convert(Vector{Float64}, h), convert(Vector{Float64}, pz), major_h)
   else
-    println("Arrays have incorrect length or dimension.")
+    error("Arrays have incorrect length or dimension.")
   end
 end
 
@@ -2763,7 +2709,7 @@ function contourf(px, py, h, pz, major_h::Int)
           (Int32, Int32, Int32, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int32),
           nx, ny, nh, convert(Vector{Float64}, px), convert(Vector{Float64}, py), convert(Vector{Float64}, h), convert(Vector{Float64}, pz), major_h)
   else
-    println("Arrays have incorrect length or dimension.")
+    error("Arrays have incorrect length or dimension.")
   end
 end
 
@@ -3450,6 +3396,14 @@ function drawgraphics(string)
   return Int(ret)
 end
 
+function startlistener()
+  ret = ccall( libGR_ptr(:gr_startlistener),
+              Int32,
+              (),
+              )
+  return Int(ret)
+end
+
 """
     mathtex(x::Real, y::Real, string)
 
@@ -3493,8 +3447,8 @@ const ASF_INDIVIDUAL = 1
 const NOCLIP = 0
 const CLIP = 1
 
-const COORDINATES_WC = 0
-const COORDINATES_NDC = 1
+const COORDINATES_NDC = 0
+const COORDINATES_WC = 1
 
 const INTSTYLE_HOLLOW = 0
 const INTSTYLE_SOLID = 1
@@ -3521,6 +3475,10 @@ const TEXT_PRECISION_STRING = 0
 const TEXT_PRECISION_CHAR = 1
 const TEXT_PRECISION_STROKE = 2
 const TEXT_PRECISION_OUTLINE = 3
+
+const SCIENTIFIC_FORMAT_OPTION_E = 1
+const SCIENTIFIC_FORMAT_OPTION_TEXTEX = 2
+const SCIENTIFIC_FORMAT_OPTION_MATHTEX = 3
 
 const LINETYPE_SOLID = 1
 const LINETYPE_DASHED = 2
@@ -3586,6 +3544,10 @@ const OPTION_X_LN = 512
 const OPTION_Y_LN = 1024
 const OPTION_Z_LN = 2048
 
+const SPEC_LINE = 1
+const SPEC_MARKER = 2
+const SPEC_COLOR = 4
+
 const OPTION_LINES = 0
 const OPTION_MESH = 1
 const OPTION_FILLED_MESH = 2
@@ -3598,7 +3560,7 @@ const OPTION_3D_MESH = 7
 const MODEL_RGB = 0
 const MODEL_HSV = 1
 
-const COLORMAP_UNIFORM = 0
+const COLORMAP_DEFAULT = 0
 const COLORMAP_TEMPERATURE = 1
 const COLORMAP_GRAYSCALE = 2
 const COLORMAP_GLOWING = 3
@@ -3646,6 +3608,28 @@ const COLORMAP_VIRIDIS = 44
 const COLORMAP_INFERNO = 45
 const COLORMAP_PLASMA = 46
 const COLORMAP_MAGMA = 47
+const COLORMAP_UNIFORM = 48
+
+const COLOR_AMBER = 980
+const COLOR_PURPLE = 981
+const COLOR_ORANGE = 982
+const COLOR_TEAL_BLUE = 983
+const COLOR_DARK_RED = 984
+const COLOR_LIGHT_BROWN = 985
+const COLOR_GRAY = 986
+const COLOR_GREEN = 987
+const COLOR_PINK = 988
+const COLOR_NAVY_BLUE = 989
+const COLOR_SALMON = 990
+const COLOR_ROYAL_PURPLE = 991
+const COLOR_BRIGHT_ORANGE = 992
+const COLOR_CARDINAL_RED = 993
+const COLOR_YELLOW = 994
+const COLOR_MAROON = 995
+const COLOR_OLIVE = 996
+const COLOR_BROWN = 997
+const COLOR_RED = 998
+const COLOR_DARK_GRAY = 999
 
 const FONT_TIMES_ROMAN = 101
 const FONT_TIMES_ITALIC = 102
@@ -3678,6 +3662,12 @@ const FONT_PALATINO_BOLD = 128
 const FONT_PALATINO_BOLDITALIC = 129
 const FONT_ZAPFCHANCERY_MEDIUMITALIC = 130
 const FONT_ZAPFDINGBATS = 131
+const FONT_COMPUTERMODERN = 232
+const FONT_DEJAVUSANS = 233
+const FONT_STIX_TWO_MATH = 234
+
+const TEXT_USE_WC = 1
+const TEXT_ENABLE_INLINE_MATH = 2
 
 const PATH_STOP      = 0x00
 const PATH_MOVETO    = 0x01
@@ -3700,10 +3690,21 @@ const XFORM_LOGLOG = 3
 const XFORM_CUBIC = 4
 const XFORM_EQUALIZED = 5
 
+const AXES_SIMPLE_AXES = 1
+const AXES_TWIN_AXES = 2
+const AXES_WITH_GRID = 4
+
+const REGION_RECTANGLE = 0
+const REGION_ELLIPSE = 1
+
 # GR3 functions
 include("gr3.jl")
 
 const gr3 = GR.GR3
+
+# GRM functions
+include("grm.jl")
+const grm = GR.GRM
 
 # Convenience functions
 include("jlgr.jl")
@@ -3719,6 +3720,63 @@ mutable struct HTML s::AbstractString end
 Base.show(io::IO, ::MIME"image/svg+xml", x::SVG) = write(io, x.s)
 Base.show(io::IO, ::MIME"image/png", x::PNG) = write(io, x.s)
 Base.show(io::IO, ::MIME"text/html", x::HTML) = print(io, x.s)
+
+struct c_tick_t
+  value::Cdouble
+  is_major::Cint
+end
+
+struct c_tick_label_t
+  tick::Cdouble
+  label::Cstring
+  width::Cdouble
+end
+
+Base.@kwdef mutable struct c_axis_t
+  spec::Cstring = C_NULL
+  min::Cdouble = NaN
+  max::Cdouble = NaN
+  tick::Cdouble = NaN
+  org::Cdouble = NaN
+  position::Cdouble = NaN
+  major_count::Cint = 1
+  num_ticks::Cint = 0
+  ticks::Ptr{c_tick_t} = C_NULL
+  tick_size::Cdouble = NaN
+  num_tick_labels::Cint = 0
+  tick_labels::Ptr{c_tick_label_t} = C_NULL
+  label_position::Cdouble = NaN
+  draw_axis_line::Cint = 1
+  label_orientation::Cint = 0
+end
+
+mutable struct GRTick
+  value::Real
+  is_major::Int
+end
+
+mutable struct GRTickLabel
+  tick::Real
+  label::String
+  width::Real
+end
+
+Base.@kwdef mutable struct GRAxis
+  spec::String = ""
+  min::Real = NaN
+  max::Real = NaN
+  tick::Real = NaN
+  org::Real = NaN
+  position::Real = NaN
+  major_count::Int = 1
+  num_ticks::Int = 0
+  ticks::Vector{GRTick} = GRTick[]
+  tick_size::Real = NaN
+  tick_labels::Vector{GRTickLabel} = GRTickLabel[]
+  label_position::Real = NaN
+  draw_axis_line::Int = 1
+  label_orientation::Int = 0
+end
 
 function _readfile(path)
     data = Array{UInt8}(undef, filesize(path))
@@ -3743,13 +3801,14 @@ function inline(mime="svg", scroll=true)
         if mime == "iterm"
             file_path[] = tempname() * ".png"
             ENV["GKS_WSTYPE"] = "png"
+            usecolorscheme(is_dark_mode() ? 2 : 1)
         elseif mime == "mlterm"
             file_path[] = tempname() * ".six"
             ENV["GKS_WSTYPE"] = "six"
         elseif mime == "js"
             file_path[] = nothing
             ENV["GRDISPLAY"] = "js"
-            send_c[], recv_c[] = js.initjs()
+            js.initjs()
         else
             file_path[] = tempname() * "." * mime
             ENV["GKS_WSTYPE"] = mime
@@ -3908,7 +3967,7 @@ function interp2(X, Y, Z, Xq, Yq, method::Int=0, extrapval=0)
           ny, nx, convert(Vector{Float64}, Y), convert(Vector{Float64}, X), convert(Vector{Float64}, Z), nyq, nxq, convert(Vector{Float64}, Yq), convert(Vector{Float64}, Xq), Zq, method, extrapval)
     reshape(Zq, nyq, nxq)
   else
-    println("Arrays have incorrect length or dimension.")
+    error("Arrays have incorrect length or dimension.")
     Z
   end
 end
@@ -4025,7 +4084,7 @@ function quiver(x, y, u, v, color::Bool=false)
           (Int32, Int32, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Ptr{Float64}, Int32),
           nx, ny, convert(Vector{Float64}, x), convert(Vector{Float64}, y), convert(Vector{Float64}, u), convert(Vector{Float64}, v), convert(Int32, color))
   else
-    println("Arrays have incorrect length or dimension.")
+    error("Arrays have incorrect length or dimension.")
   end
 end
 
@@ -4051,9 +4110,9 @@ end
 
 function check_for_updates()
     @eval GR begin
-        import HTTP
-        requ = HTTP.request("GET", "https://api.github.com/repos/sciapp/gr/releases/latest")
-        body = String(requ.body)
+        import Downloads
+        requ = Downloads.download("https://api.github.com/repos/sciapp/gr/releases/latest"; method="GET")
+        body = read(requ, String)
 
         import JSON
         tag = JSON.parse(body)["tag_name"]
@@ -4338,6 +4397,13 @@ function inqvpsize()
   return width[1], height[1], device_pixel_ratio[1]
 end
 
+function setpicturesizeforvolume(width::Int, height::Int)
+  ccall( libGR_ptr(:gr_setpicturesizeforvolume),
+        Nothing,
+        (Cint, Cint),
+        width, height)
+end
+
 function inqtransformationparameters()
   cam_x = Cdouble[0]
   cam_y = Cdouble[0]
@@ -4372,16 +4438,222 @@ function setscientificformat(format_option)
         format_option)
 end
 
+function setnominalsize(factor)
+    ccall( libGR_ptr(:gr_setnominalsize),
+        Nothing,
+        (Float64, ),
+        factor)
+end
+
+function inqprojectiontype()
+    proj = Cint[0]
+    ccall( libGR_ptr(:gr_inqprojectiontype),
+          Nothing,
+          (Ptr{Cint}, ),
+          proj)
+    return Int(proj[1])
+end
+
+function beginselection(index, type)
+    ccall( libGR_ptr(:gr_beginselection),
+        Nothing,
+        (Cint, Cint),
+        index, type)
+end
+
+function endselection()
+    ccall( libGR_ptr(:gr_endselection),
+        Nothing,
+        (),
+        )
+end
+
+function moveselection(x, y)
+    ccall( libGR_ptr(:gr_moveselection),
+        Nothing,
+        (Cdouble, Cdouble),
+        x, y)
+end
+
+function setbackground()
+    ccall( libGR_ptr(:gr_setbackground),
+        Nothing,
+        (),
+        )
+end
+
+function clearbackground()
+    ccall( libGR_ptr(:gr_clearbackground),
+        Nothing,
+        (),
+        )
+end
+
+function setmathfont(font::Int)
+  ccall( libGR_ptr(:gr_setmathfont),
+        Nothing,
+        (Int32, ),
+        font)
+end
+
+function inqmathfont()
+  _font = Cint[0]
+  ccall( libGR_ptr(:gr_inqmathfont),
+        Nothing,
+        (Ptr{Cint}, ),
+        _font)
+  return _font[1]
+end
+
+function setclipregion(region::Int)
+  ccall( libGR_ptr(:gr_setclipregion),
+        Nothing,
+        (Int32, ),
+        region)
+end
+
+function inqclipregion()
+  _region = Cint[0]
+  ccall( libGR_ptr(:gr_inqclipregion),
+        Nothing,
+        (Ptr{Cint}, ),
+        _region)
+  return _region[1]
+end
+
+function setclipsector(start_angle::Real, end_angle::Real)
+  ccall( libGR_ptr(:gr_setclipsector),
+        Nothing,
+        (Cdouble, Cdouble),
+        start_angle, end_angle)
+end
+
+function inqclipsector()
+  _start_angle = Cdouble[0]
+  _end_angle = Cdouble[0]
+  ccall( libGR_ptr(:gr_inqclipsector),
+        Nothing,
+        (Ptr{Cdouble}, Ptr{Cdouble}),
+        _start_angle, _end_angle)
+  return _start_angle[1], _end_angle[1]
+end
+
+function getformat(origin::Real, amin::Real, amax::Real, tick::Real, major::Int)
+  _format = Cint[0, 0]
+  ccall( libGR_ptr(:gr_getformat),
+        Nothing,
+        (Ptr{Cint}, Cdouble, Cdouble, Cdouble, Cdouble, Cint),
+        _format, origin, amin, amax, tick, major)
+  return Int32[_format...]
+end
+
+function ftoa(value::Real, format::Vector{Int32})
+  string = Vector{UInt8}(undef, 256)
+  s = ccall( libGR_ptr(:gr_ftoa),
+            Cstring,
+            (Ptr{UInt8}, Cdouble, Ptr{Cint}),
+            string, value, format)
+  return unsafe_string(s)
+end
+
+function axis(spec::String; min::Real = NaN, max::Real = NaN, tick::Real = NaN, org::Real = NaN, position::Real = NaN, major_count::Int = 1, ticks::Vector{GRTick} = GRTick[], tick_size::Real = NaN, tick_labels::Vector{GRTickLabel }= GRTickLabel[], label_position::Real = NaN, draw_axis_line::Int = 1, label_orientation::Int = 0)::GRAxis
+  c_axis = c_axis_t(spec=Base.unsafe_convert(Cstring, spec), min=min, max=max, tick=tick, org=org, position=position, major_count=major_count, tick_size=tick_size, label_position=label_position, draw_axis_line=draw_axis_line, label_orientation=label_orientation)
+  if !isnothing(ticks)
+    array = c_tick_t[]
+    for tick in ticks
+      push!(array, c_tick_t(tick.value, tick.is_major))
+    end
+    c_axis.ticks = pointer(array)
+    c_axis.num_ticks = size(ticks)[1]
+  else
+    c_axis.ticks = C_NULL
+    c_axis.num_ticks = 0
+  end
+  if !isnothing(tick_labels)
+    array = c_tick_label_t[]
+    for tick_label in tick_labels
+      push!(array, c_tick_label_t(tick_label.tick, Base.unsafe_convert(Cstring, tick_label.label), tick_label.width))
+    end
+    c_axis.tick_labels = pointer(array)
+    c_axis.num_tick_labels = size(tick_labels)[1]
+  else
+    c_axis.tick_labels = C_NULL
+    c_axis.num_tick_labels = 0
+  end
+  ccall( libGR_ptr(:gr_axis),
+        Nothing,
+        (Cstring, Ptr{c_axis_t}),
+        spec, Ref(c_axis))
+
+  ticks = GRTick[]
+  for i in 1:c_axis.num_ticks
+    tick = unsafe_load(c_axis.ticks, i)
+    push!(ticks, GRTick(tick.value, tick.is_major))
+  end
+
+  tick_labels = GRTickLabel[]
+  for i in 1:c_axis.num_tick_labels
+    tick_label = unsafe_load(c_axis.tick_labels, i)
+    if tick_label.label != C_NULL
+      push!(tick_labels, GRTickLabel(tick_label.tick, unsafe_string(tick_label.label), tick_label.width))
+    end
+  end
+
+  return GRAxis(spec=unsafe_string(c_axis.spec), min=c_axis.min, max=c_axis.max, tick=c_axis.tick, org=c_axis.org, position=c_axis.position, major_count=c_axis.major_count, ticks=ticks, tick_size=c_axis.tick_size, tick_labels=tick_labels, label_position=c_axis.label_position, draw_axis_line=c_axis.draw_axis_line, label_orientation=c_axis.label_orientation)
+end
+
+function to_c_axis(axis::GRAxis)::c_axis_t
+  c_axis = c_axis_t(spec=Base.unsafe_convert(Cstring, axis.spec), min=axis.min, max=axis.max, tick=axis.tick, org=axis.org, position=axis.position, major_count=axis.major_count, tick_size=axis.tick_size, label_position=axis.label_position, draw_axis_line=axis.draw_axis_line, label_orientation=axis.label_orientation)
+  if !isnothing(axis.ticks)
+    ticks = c_tick_t[]
+    for tick in axis.ticks
+      push!(ticks, c_tick_t(tick.value, tick.is_major))
+    end
+    c_axis.ticks = pointer(ticks)
+    c_axis.num_ticks = size(axis.ticks)[1]
+  else
+    c_axis.ticks = C_NULL
+    c_axis.num_ticks = 0
+  end
+  if !isnothing(axis.tick_labels)
+    tick_labels = c_tick_label_t[]
+    for tick_label in axis.tick_labels
+      push!(tick_labels, c_tick_label_t(tick_label.tick, pointer(tick_label.label), tick_label.width))
+    end
+    c_axis.tick_labels = pointer(tick_labels)
+    c_axis.num_tick_labels = size(axis.tick_labels)[1]
+  else
+    c_axis.tick_labels = C_NULL
+    c_axis.num_tick_labels = 0
+  end
+  c_axis
+end
+
+function drawaxis(axis::GRAxis)
+  c_axis = to_c_axis(axis)
+  ccall( libGR_ptr(:gr_drawaxis),
+        Nothing,
+        (Ptr{c_axis_t}, ),
+        Ref(c_axis))
+end
+
+function drawaxes(x_axis::Union{GRAxis, Nothing}, y_axis::Union{GRAxis, Nothing}, options::Int=AXES_SIMPLE_AXES|AXES_TWIN_AXES|AXES_WITH_GRID)
+  if x_axis !== nothing
+    c_x_axis = to_c_axis(x_axis)
+  end
+  if y_axis !== nothing
+    c_y_axis = to_c_axis(y_axis)
+  end
+  ccall( libGR_ptr(:gr_drawaxes),
+        Nothing,
+        (Ptr{c_axis_t}, Ptr{c_axis_t}, Cint),
+        x_axis !== nothing ? Ref(c_x_axis) : C_NULL, y_axis !== nothing ? Ref(c_y_axis) : C_NULL, options)
+end
+
 # JS functions
 include("js.jl")
 
-precompile(init,(Bool,))
-precompile(ispluto,())
-precompile(isvscode,())
-precompile(isatom,())
-precompile(updatews,())
-
-precompile(polyline, (Vector{Float64}, Vector{Float64}))
-precompile(axes, (Float64, Float64, Int64, Int64, Int64, Int64, Float64))
+include("precompile.jl")
+_precompile_()
 
 end # module

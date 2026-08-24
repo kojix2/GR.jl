@@ -4,8 +4,6 @@ rng = MersenneTwister(1234)
 import Plots
 const GR = Plots.GR
 
-GR.__init__()
-
 x = 0:π/100:2π
 y = sin.(x)
 GR.plot(x, y)
@@ -14,7 +12,7 @@ x = LinRange(0, 1, 51)
 y = x .- x.^2
 GR.scatter(x, y)
 
-sz = LinRange(50, 300, length(x))
+sz = LinRange(0.5, 3, length(x))
 c = LinRange(0, 255, length(x))
 GR.scatter(x, y, sz, c)
 
@@ -143,7 +141,12 @@ GR.axes(0.25, 0.25, -2, -2, 2, 2, 0.01)
 
 GR.updatews()
 
-Plots.gr()
+sleep(3)
+
+GR.emergencyclosegks()
+
+Plots.gr(show=true)
+
 x = 1:10; y = rand(rng, 10);
 Plots.plot(x,y)
 
@@ -165,3 +168,4 @@ StatsPlots.violin(["Series 1" "Series 2" "Series 3" "Series 4"], y, leg = false)
 
 StatsPlots.boxplot!(["Series 1" "Series 2" "Series 3" "Series 4"], y, leg = false)
 
+sleep(3)

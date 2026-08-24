@@ -1,4 +1,4 @@
-const libGR_syms = [
+[
 :gr_setcallback
 :gr_initgr
 :gr_opengks
@@ -59,6 +59,7 @@ const libGR_syms = [
 :gr_redrawsegws
 :gr_setsegtran
 :gr_closeseg
+:gr_samplelocator
 :gr_emergencyclosegks
 :gr_updategks
 :gr_setspace
@@ -73,6 +74,7 @@ const libGR_syms = [
 :gr_polyline3d
 :gr_polymarker3d
 :gr_axes3d
+:gr_settitles3d
 :gr_titles3d
 :gr_surface
 :gr_contour
@@ -111,6 +113,7 @@ const libGR_syms = [
 :gr_endgraphics
 :gr_getgraphics
 :gr_drawgraphics
+:gr_startlistener
 :gr_mathtex
 :gr_inqmathtex
 :gr_setregenflags
@@ -147,7 +150,26 @@ const libGR_syms = [
 :gr_inqtextencoding
 :gr_loadfont
 :gr_inqvpsize
+:gr_setpicturesizeforvolume
 :gr_inqtransformationparameters
 :gr_polygonmesh3d
 :gr_setscientificformat
+:gr_setnominalsize
+:gr_inqprojectiontype
+:gr_beginselection
+:gr_endselection
+:gr_moveselection
+:gr_setbackground
+:gr_clearbackground
+:gr_setmathfont
+:gr_inqmathfont
+:gr_setclipregion
+:gr_inqclipregion
+:gr_setclipsector
+:gr_inqclipsector
+:gr_getformat
+:gr_ftoa
+:gr_axis
+:gr_drawaxis
+:gr_drawaxes
 ]
